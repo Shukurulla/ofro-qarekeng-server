@@ -1,64 +1,75 @@
-// Levenshtein Distance algoritmi - AI emas, klassik algoritm
-function levenshteinDistance(str1, str2) {
-  const matrix = [];
+// utils/spellCheck.js - YANGILANGAN VA OPTIMIZATSIYA QILINGAN
 
-  // Matritsa yaratish
-  for (let i = 0; i <= str2.length; i++) {
-    matrix[i] = [i];
-  }
+const { correctKarakalpakWords } = require("./transliterate");
 
-  for (let j = 0; j <= str1.length; j++) {
-    matrix[0][j] = j;
-  }
+// Tezkor Levenshtein Distance algoritmi (optimizatsiya qilingan)
+function levenshteinDistance(str1, str2, maxDistance = 3) {
+  const len1 = str1.length;
+  const len2 = str2.length;
 
-  // Matritsa to'ldirish
-  for (let i = 1; i <= str2.length; i++) {
-    for (let j = 1; j <= str1.length; j++) {
-      if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
-        matrix[i][j] = matrix[i - 1][j - 1];
+  // Agar farq juda katta bo'lsa, hisoblashni to'xtatish
+  if (Math.abs(len1 - len2) > maxDistance) return maxDistance + 1;
+
+  // Kichik massiv ishlatish (memory efficient)
+  const matrix = Array(len2 + 1)
+    .fill(null)
+    .map(() => Array(len1 + 1).fill(0));
+
+  // Birinchi qator va ustunni to'ldirish
+  for (let i = 0; i <= len1; i++) matrix[0][i] = i;
+  for (let j = 0; j <= len2; j++) matrix[j][0] = j;
+
+  for (let j = 1; j <= len2; j++) {
+    for (let i = 1; i <= len1; i++) {
+      if (str1[i - 1] === str2[j - 1]) {
+        matrix[j][i] = matrix[j - 1][i - 1];
       } else {
-        matrix[i][j] = Math.min(
-          matrix[i - 1][j - 1] + 1, // almashtirish
-          matrix[i][j - 1] + 1, // qo'shish
-          matrix[i - 1][j] + 1 // o'chirish
+        matrix[j][i] = Math.min(
+          matrix[j - 1][i - 1] + 1, // almashtirish
+          matrix[j][i - 1] + 1, // qo'shish
+          matrix[j - 1][i] + 1 // o'chirish
         );
       }
+
+      // Agar juda katta bo'lsa, to'xtatish
+      if (matrix[j][i] > maxDistance) return maxDistance + 1;
     }
   }
 
-  return matrix[str2.length][str1.length];
+  return matrix[len2][len1];
 }
 
-// Matnni so'zlarga ajratish
+// So'zlarni tezkor ajratish (regex optimizatsiya)
 function tokenizeText(text) {
-  // Tinish belgilari va bo'shliqlar bilan ajratish
-  const words = text.match(/[\wәğqńöüşıĞQŃÖÜŞIа-яәғқңөүһ]+/gi) || [];
-  const positions = [];
-  let lastIndex = 0;
+  if (!text || typeof text !== "string") return [];
 
-  words.forEach((word) => {
-    const index = text.indexOf(word, lastIndex);
+  // Qoraqolpoq tili uchun maxsus regex
+  const wordRegex = /[\wәğqńöüşıĞQŃÖÜŞIа-яәғқңөүһҳ]+/g;
+  const positions = [];
+  let match;
+
+  while ((match = wordRegex.exec(text)) !== null) {
     positions.push({
-      word: word.toLowerCase(),
-      originalWord: word,
-      start: index,
-      end: index + word.length,
+      word: match[0].toLowerCase(),
+      originalWord: match[0],
+      start: match.index,
+      end: match.index + match[0].length,
     });
-    lastIndex = index + word.length;
-  });
+  }
 
   return positions;
 }
 
-// So'zni normallashtirish
+// So'zni tezkor normallashtirish
 function normalizeWord(word) {
+  if (!word) return "";
   return word
     .toLowerCase()
     .trim()
-    .replace(/[^\wәğqńöüşıĞQŃÖÜŞIа-яәғқңөүһ]/g, "");
+    .replace(/[^\wәğqńöüşıĞQŃÖÜŞIа-яәғқңөүһҳ]/g, "");
 }
 
-// Yaqin so'zlarni topish
+// Yaqin so'zlarni topish - OPTIMIZATSIYA QILINGAN
 function findSimilarWords(
   targetWord,
   wordsList,
@@ -68,68 +79,120 @@ function findSimilarWords(
   const suggestions = [];
   const normalizedTarget = normalizeWord(targetWord);
 
-  wordsList.forEach((wordObj) => {
+  // Birinchi bosqich: substring matches (tezroq)
+  const exactMatches = [];
+  const similarMatches = [];
+
+  for (
+    let i = 0;
+    i < wordsList.length && exactMatches.length < maxResults;
+    i++
+  ) {
+    const wordObj = wordsList[i];
     const word = typeof wordObj === "string" ? wordObj : wordObj.word;
     const normalizedWord = normalizeWord(word);
 
-    // Bir xil so'zni o'tkazib yuborish
-    if (normalizedWord === normalizedTarget) return;
+    // O'zini o'tkazib yuborish
+    if (normalizedWord === normalizedTarget) continue;
 
-    const distance = levenshteinDistance(normalizedTarget, normalizedWord);
-
-    if (distance <= maxDistance) {
-      suggestions.push({
+    // Substring match
+    if (
+      normalizedWord.includes(normalizedTarget) ||
+      normalizedTarget.includes(normalizedWord)
+    ) {
+      exactMatches.push({
         word: word,
-        distance: distance,
-        confidence: Math.max(0, 100 - distance * 25), // Ishonch darajasi
+        distance: 0,
+        confidence: 95,
+        type: "substring",
       });
     }
-  });
+  }
 
-  // Eng yaqin so'zlarni saralash
-  return suggestions
-    .sort((a, b) => a.distance - b.distance || b.confidence - a.confidence)
-    .slice(0, maxResults);
+  // Ikkinchi bosqich: Levenshtein distance (agar kerak bo'lsa)
+  if (exactMatches.length < maxResults) {
+    const remaining = maxResults - exactMatches.length;
+
+    for (
+      let i = 0;
+      i < wordsList.length && similarMatches.length < remaining * 2;
+      i++
+    ) {
+      const wordObj = wordsList[i];
+      const word = typeof wordObj === "string" ? wordObj : wordObj.word;
+      const normalizedWord = normalizeWord(word);
+
+      // Allaqachon exact match bo'lganlarni o'tkazib yuborish
+      if (exactMatches.some((m) => normalizeWord(m.word) === normalizedWord))
+        continue;
+
+      const distance = levenshteinDistance(
+        normalizedTarget,
+        normalizedWord,
+        maxDistance
+      );
+
+      if (distance <= maxDistance) {
+        similarMatches.push({
+          word: word,
+          distance: distance,
+          confidence: Math.max(0, 100 - distance * 25),
+          type: "similar",
+        });
+      }
+    }
+  }
+
+  // Saralash va birlashtirish
+  const allSuggestions = [
+    ...exactMatches,
+    ...similarMatches.sort(
+      (a, b) => a.distance - b.distance || b.confidence - a.confidence
+    ),
+  ];
+
+  return allSuggestions.slice(0, maxResults);
 }
 
-// Matn imlosini tekshirish
+// Matn imlosini tezkor tekshirish - YANGILANGAN
 function checkTextSpelling(text, dictionary) {
+  if (!text || !dictionary || dictionary.length === 0) return [];
+
   const tokens = tokenizeText(text);
   const results = [];
 
+  // Dictionary ni Map ga aylantirish (tezroq qidirish uchun)
+  const dictionaryMap = new Map();
+  dictionary.forEach((wordObj) => {
+    const word = typeof wordObj === "string" ? wordObj : wordObj.word;
+    const normalizedWord = normalizeWord(word);
+    dictionaryMap.set(normalizedWord, wordObj);
+  });
+
   tokens.forEach((token) => {
-    const isCorrect = dictionary.some((wordObj) => {
-      const word = typeof wordObj === "string" ? wordObj : wordObj.word;
-      return normalizeWord(word) === normalizeWord(token.word);
-    });
+    const isCorrect = dictionaryMap.has(normalizeWord(token.word));
 
+    const result = {
+      word: token.originalWord,
+      normalizedWord: token.word,
+      start: token.start,
+      end: token.end,
+      isCorrect: isCorrect,
+      suggestions: [],
+    };
+
+    // Agar xato bo'lsa, takliflar topish
     if (!isCorrect) {
-      const suggestions = findSimilarWords(token.word, dictionary);
-
-      results.push({
-        word: token.originalWord,
-        normalizedWord: token.word,
-        start: token.start,
-        end: token.end,
-        isCorrect: false,
-        suggestions: suggestions,
-      });
-    } else {
-      results.push({
-        word: token.originalWord,
-        normalizedWord: token.word,
-        start: token.start,
-        end: token.end,
-        isCorrect: true,
-        suggestions: [],
-      });
+      result.suggestions = findSimilarWords(token.word, dictionary, 2, 3);
     }
+
+    results.push(result);
   });
 
   return results;
 }
 
-// So'z qidirish (fuzzy search)
+// So'z qidirish (fuzzy search) - OPTIMIZATSIYA QILINGAN
 function fuzzySearch(query, dictionary, limit = 10) {
   const normalizedQuery = normalizeWord(query);
   const results = [];
@@ -137,44 +200,147 @@ function fuzzySearch(query, dictionary, limit = 10) {
   dictionary.forEach((wordObj) => {
     const word = typeof wordObj === "string" ? wordObj : wordObj.word;
     const normalizedWord = normalizeWord(word);
+    const wordType = typeof wordObj === "object" ? wordObj.type : null;
 
     // To'g'ridan-to'g'ri mos kelish
     if (normalizedWord.includes(normalizedQuery)) {
       results.push({
         word: word,
-        type: "exact",
+        type: wordType || "exact",
         score: 100,
+        matchType: "substring",
       });
     } else {
       // Yaqin so'zlar
-      const distance = levenshteinDistance(normalizedQuery, normalizedWord);
+      const distance = levenshteinDistance(normalizedQuery, normalizedWord, 3);
       if (distance <= 3) {
         results.push({
           word: word,
-          type: "similar",
+          type: wordType || "similar",
           score: Math.max(0, 100 - distance * 20),
+          matchType: "similar",
+          distance: distance,
         });
       }
     }
   });
 
-  return results.sort((a, b) => b.score - a.score).slice(0, limit);
+  return results
+    .sort((a, b) => {
+      // Birinchi substring matches, keyin similar
+      if (a.matchType !== b.matchType) {
+        return a.matchType === "substring" ? -1 : 1;
+      }
+      return b.score - a.score;
+    })
+    .slice(0, limit);
 }
 
-// Matn statistikasi
+// Matn statistikasi - YAXSHILANGAN
 function getTextStatistics(text, spellResults) {
   const totalWords = spellResults.length;
   const correctWords = spellResults.filter((r) => r.isCorrect).length;
   const incorrectWords = totalWords - correctWords;
   const accuracy = totalWords > 0 ? (correctWords / totalWords) * 100 : 0;
 
+  // Qo'shimcha statistikalar
+  const uniqueErrors = new Set(
+    spellResults.filter((r) => !r.isCorrect).map((r) => r.normalizedWord)
+  ).size;
+
+  const averageWordLength =
+    totalWords > 0
+      ? spellResults.reduce((sum, r) => sum + r.word.length, 0) / totalWords
+      : 0;
+
+  const readingTime = Math.ceil(totalWords / 200); // 200 so'z/daqiqa
+
   return {
     totalWords,
     correctWords,
     incorrectWords,
-    accuracy: parseFloat(accuracy.toFixed(2)),
+    uniqueErrors,
+    accuracy: Math.round(accuracy * 100) / 100,
     textLength: text.length,
+    averageWordLength: Math.round(averageWordLength * 10) / 10,
+    readingTime: readingTime,
+    wordsPerSentence:
+      totalWords > 0
+        ? Math.round(
+            totalWords / Math.max(1, (text.match(/[.!?]/g) || []).length)
+          )
+        : 0,
   };
+}
+
+// Avtomatik to'g'rilash funksiyasi - YANGI
+function autoCorrectText(text, dictionary) {
+  // 1. Qoraqolpoq tiliga xos xatolarni to'g'rilash
+  let correctedText = correctKarakalpakWords(text);
+
+  // 2. Imlo xatolarini avtomatik to'g'rilash
+  const spellResults = checkTextSpelling(correctedText, dictionary);
+
+  // O'zgarishlar ro'yxati
+  const corrections = [];
+  let offsetChange = 0;
+
+  spellResults.forEach((result) => {
+    if (!result.isCorrect && result.suggestions.length > 0) {
+      // Eng yaxshi taklifni tanlash (confidence > 80)
+      const bestSuggestion = result.suggestions[0];
+      if (bestSuggestion.confidence > 80) {
+        const originalStart = result.start + offsetChange;
+        const originalEnd = result.end + offsetChange;
+
+        const before = correctedText.slice(0, originalStart);
+        const after = correctedText.slice(originalEnd);
+
+        corrections.push({
+          original: result.word,
+          corrected: bestSuggestion.word,
+          position: originalStart,
+          confidence: bestSuggestion.confidence,
+        });
+
+        correctedText = before + bestSuggestion.word + after;
+        offsetChange += bestSuggestion.word.length - result.word.length;
+      }
+    }
+  });
+
+  return {
+    correctedText: correctedText,
+    corrections: corrections,
+    correctionCount: corrections.length,
+    originalText: text,
+  };
+}
+
+// Cache tizimi (server-side memory cache)
+const spellCheckCache = new Map();
+const MAX_CACHE_SIZE = 1000;
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minut
+
+function getCachedResult(key) {
+  const cached = spellCheckCache.get(key);
+  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+    return cached.data;
+  }
+  return null;
+}
+
+function setCachedResult(key, data) {
+  // Cache size ni nazorat qilish
+  if (spellCheckCache.size >= MAX_CACHE_SIZE) {
+    const firstKey = spellCheckCache.keys().next().value;
+    spellCheckCache.delete(firstKey);
+  }
+
+  spellCheckCache.set(key, {
+    data: data,
+    timestamp: Date.now(),
+  });
 }
 
 module.exports = {
@@ -185,4 +351,7 @@ module.exports = {
   checkTextSpelling,
   fuzzySearch,
   getTextStatistics,
+  autoCorrectText,
+  getCachedResult,
+  setCachedResult,
 };

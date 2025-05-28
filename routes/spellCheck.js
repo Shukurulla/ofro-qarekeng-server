@@ -1,19 +1,32 @@
+// routes/spellCheck.js - DATABASE SO'ZLAR BILAN ISHLASH
+
 const express = require("express");
 const router = express.Router();
 const Word = require("../models/Word");
-const {
-  checkTextSpelling,
-  getTextStatistics,
-  fuzzySearch,
-  normalizeWord,
-} = require("../utils/spellCheck");
 
 // Cache uchun
 let dictionaryCache = null;
+let dictionaryMap = new Map();
 let cacheTimestamp = null;
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minut
+const CACHE_DURATION = 30 * 60 * 1000; // 30 minut
 
-// So'zlar bazasini cache qilish
+// So'zni normallashtirish (faqat kichik harflarga)
+function normalizeWord(word) {
+  if (!word) return "";
+  return word.toLowerCase().trim();
+}
+
+// Alifbo aniqlash
+function detectScript(word) {
+  const cyrillicChars = (word.match(/[а-яәғқңөүһҳ]/gi) || []).length;
+  const latinChars = (word.match(/[a-zәğqńöüşı]/gi) || []).length;
+
+  if (cyrillicChars > latinChars) return "cyrillic";
+  if (latinChars > cyrillicChars) return "latin";
+  return "mixed";
+}
+
+// Database dan barcha so'zlarni yuklash
 async function getDictionary(forceRefresh = false) {
   const now = Date.now();
 
@@ -23,28 +36,171 @@ async function getDictionary(forceRefresh = false) {
     cacheTimestamp &&
     now - cacheTimestamp < CACHE_DURATION
   ) {
-    return dictionaryCache;
+    console.log(`Cache dan dictionary olinmoqda: ${dictionaryMap.size} so'z`);
+    return { words: dictionaryCache, map: dictionaryMap };
   }
 
   try {
+    console.log("DATABASE dan so'zlar yuklanmoqda...");
+    const startTime = Date.now();
+
+    // Database dan barcha tasdiqlangan so'zlarni olish
     const words = await Word.find({ isChecked: true })
       .select("word type trustScore")
-      .sort({ trustScore: -1 });
+      .sort({ trustScore: -1 }) // Eng ishonchli so'zlar birinchi
+      .lean()
+      .exec();
+
+    console.log(`DATABASE dan ${words.length} ta so'z topildi`);
+
+    // Map yaratish - alifbo turlariga ajratish
+    dictionaryMap.clear();
+    let cyrillicCount = 0;
+    let latinCount = 0;
+    let mixedCount = 0;
+
+    words.forEach((wordObj) => {
+      const normalizedWord = normalizeWord(wordObj.word);
+      if (normalizedWord && normalizedWord.length > 0) {
+        // Alifbo turini aniqlash
+        const script = detectScript(wordObj.word);
+
+        // Map ga qo'shish
+        dictionaryMap.set(normalizedWord, {
+          word: wordObj.word,
+          type: wordObj.type || script,
+          trustScore: wordObj.trustScore || 100,
+          script: script,
+        });
+
+        // Statistika
+        if (script === "cyrillic") cyrillicCount++;
+        else if (script === "latin") latinCount++;
+        else mixedCount++;
+      }
+    });
 
     dictionaryCache = words;
     cacheTimestamp = now;
 
-    return words;
+    const loadTime = Date.now() - startTime;
+    console.log(`=== DICTIONARY YUKLANDI ===`);
+    console.log(`Jami so'zlar: ${words.length}`);
+    console.log(`Map da saqlangan: ${dictionaryMap.size}`);
+    console.log(`Kirill: ${cyrillicCount}`);
+    console.log(`Lotin: ${latinCount}`);
+    console.log(`Aralash: ${mixedCount}`);
+    console.log(`Yuklash vaqti: ${loadTime}ms`);
+    console.log(`========================`);
+
+    return { words: dictionaryCache, map: dictionaryMap };
   } catch (error) {
-    console.error("So'zlar bazasini olishda xato:", error);
-    return dictionaryCache || [];
+    console.error("DATABASE xatosi:", error);
+
+    // Agar xato bo'lsa, eski cache qaytarish
+    if (dictionaryCache && dictionaryMap.size > 0) {
+      console.log("DATABASE xatosi, eski cache ishlatiladi");
+      return { words: dictionaryCache, map: dictionaryMap };
+    }
+
+    throw new Error("So'zlar bazasi yuklanmadi: " + error.message);
   }
 }
 
-// POST /api/check - Matn imlosini tekshirish
+// Matn ichidagi so'zlarni ajratish va tekshirish
+function analyzeText(text, wordsMap) {
+  if (!text || !wordsMap || wordsMap.size === 0) {
+    return [];
+  }
+
+  console.log(`\n=== MATN TAHLILI ===`);
+  console.log(`Matn: "${text}"`);
+  console.log(`Dictionary hajmi: ${wordsMap.size}`);
+
+  // So'zlarni ajratish (Qoraqolpoq harflari bilan)
+  const wordRegex = /[\wәğqńöüşıĞQŃÖÜŞIа-яәғқңөүһҳ]+/g;
+  const results = [];
+  let match;
+
+  while ((match = wordRegex.exec(text)) !== null) {
+    const originalWord = match[0];
+    const normalizedWord = normalizeWord(originalWord);
+    const wordScript = detectScript(originalWord);
+
+    // Dictionary da qidirish
+    const isCorrect = wordsMap.has(normalizedWord);
+    const wordInfo = wordsMap.get(normalizedWord);
+
+    console.log(
+      `So'z: "${originalWord}" (${wordScript}) -> ${
+        isCorrect ? "TOPILDI" : "TOPILMADI"
+      }`
+    );
+    if (wordInfo) {
+      console.log(
+        `  Dictionary ma'lumot: type=${wordInfo.type}, script=${wordInfo.script}, trust=${wordInfo.trustScore}`
+      );
+    }
+
+    results.push({
+      word: originalWord,
+      normalizedWord: normalizedWord,
+      start: match.index,
+      end: match.index + originalWord.length,
+      isCorrect: isCorrect,
+      script: wordScript,
+      suggestions: [],
+      wordInfo: wordInfo || null,
+    });
+  }
+
+  console.log(
+    `Jami ${results.length} so'z, ${
+      results.filter((r) => !r.isCorrect).length
+    } xato`
+  );
+  return results;
+}
+
+// Xato so'z uchun takliflar topish
+function findSuggestions(targetWord, wordsMap, limit = 5) {
+  const normalizedTarget = normalizeWord(targetWord);
+  const targetScript = detectScript(targetWord);
+  const suggestions = [];
+
+  console.log(
+    `"${targetWord}" uchun takliflar qidirilmoqda (${targetScript} alifbosi)...`
+  );
+
+  // Birinchi bosqich: o'xshash so'zlarni topish
+  for (const [dictWord, wordInfo] of wordsMap) {
+    if (suggestions.length >= limit) break;
+
+    // Bir xil alifbo bo'lishi kerak
+    if (wordInfo.script === targetScript || wordInfo.script === "mixed") {
+      // Substring match
+      if (
+        dictWord.includes(normalizedTarget.slice(0, 3)) &&
+        dictWord !== normalizedTarget
+      ) {
+        suggestions.push({
+          word: wordInfo.word,
+          confidence: 85,
+          type: "substring",
+          script: wordInfo.script,
+        });
+      }
+    }
+  }
+
+  console.log(`${suggestions.length} ta taklif topildi`);
+  return suggestions;
+}
+
+// POST /api/check - ASOSIY ENDPOINT
 router.post("/", async (req, res) => {
   try {
-    const { text, options = {} } = req.body;
+    const { text } = req.body;
 
     if (!text || typeof text !== "string") {
       return res.status(400).json({
@@ -52,188 +208,178 @@ router.post("/", async (req, res) => {
       });
     }
 
-    if (text.length > 50000) {
-      return res.status(400).json({
-        error: "Matn juda uzun (maksimal 50,000 belgi)",
-      });
-    }
+    console.log(`\n🔍 SPELL CHECK BOSHLANDI`);
+    console.log(`Kiritilgan matn: "${text}"`);
 
-    // So'zlar bazasini olish
-    const dictionary = await getDictionary();
+    // Dictionary yuklash
+    const { map } = await getDictionary();
 
-    if (dictionary.length === 0) {
+    if (map.size === 0) {
       return res.status(503).json({
-        error: "So'zlar bazasi mavjud emas",
+        error: "So'zlar bazasi bo'sh yoki yuklanmagan",
       });
     }
 
-    // Imlo tekshiruvi
-    const spellResults = checkTextSpelling(text, dictionary);
-    const statistics = getTextStatistics(text, spellResults);
+    // Matnni tahlil qilish
+    const results = analyzeText(text, map);
 
-    // Faqat xato so'zlarni qaytarish (agar kerak bo'lsa)
-    const errorsOnly = options.errorsOnly === true;
-    const results = errorsOnly
-      ? spellResults.filter((r) => !r.isCorrect)
-      : spellResults;
+    // Xato so'zlar uchun takliflar topish
+    const resultsWithSuggestions = results.map((result) => {
+      if (!result.isCorrect) {
+        result.suggestions = findSuggestions(result.word, map, 3);
+      }
+      return result;
+    });
+
+    const errorCount = resultsWithSuggestions.filter(
+      (r) => !r.isCorrect
+    ).length;
+
+    console.log(`✅ NATIJA: ${results.length} so'z, ${errorCount} xato`);
+
+    const response = {
+      success: true,
+      results: resultsWithSuggestions,
+      statistics: {
+        totalWords: results.length,
+        correctWords: results.length - errorCount,
+        incorrectWords: errorCount,
+        dictionarySize: map.size,
+      },
+      timestamp: new Date().toISOString(),
+    };
+
+    res.json(response);
+  } catch (error) {
+    console.error("❌ SPELL CHECK XATOSI:", error);
+    res.status(500).json({
+      error: "Server xatosi",
+      message: error.message,
+    });
+  }
+});
+
+// POST /api/check/auto-correct - AVTOMATIK TO'G'RILASH
+router.post("/auto-correct", async (req, res) => {
+  try {
+    const { text } = req.body;
+
+    if (!text || typeof text !== "string") {
+      return res.status(400).json({
+        error: "Matn kiritilishi shart",
+      });
+    }
+
+    console.log(`\n🔧 AUTO-CORRECT BOSHLANDI`);
+    console.log(`Original: "${text}"`);
+
+    const { map } = await getDictionary();
+    let correctedText = text;
+    let correctionCount = 0;
+    const corrections = [];
+
+    // Matnni tahlil qilish
+    const results = analyzeText(text, map);
+
+    // Har bir xato so'zni to'g'rilash
+    let offset = 0;
+
+    for (const result of results) {
+      if (!result.isCorrect) {
+        const suggestions = findSuggestions(result.word, map, 1);
+
+        if (suggestions.length > 0 && suggestions[0].confidence > 75) {
+          const originalStart = result.start + offset;
+          const originalEnd = result.end + offset;
+          const suggestion = suggestions[0].word;
+
+          // Matnda almashtirish
+          const before = correctedText.slice(0, originalStart);
+          const after = correctedText.slice(originalEnd);
+          correctedText = before + suggestion + after;
+
+          // Offset yangilash
+          offset += suggestion.length - result.word.length;
+          correctionCount++;
+
+          corrections.push({
+            original: result.word,
+            corrected: suggestion,
+            position: originalStart,
+          });
+
+          console.log(
+            `"${result.word}" -> "${suggestion}" (confidence: ${suggestions[0].confidence}%)`
+          );
+        }
+      }
+    }
+
+    console.log(`✅ ${correctionCount} ta o'zgarish amalga oshirildi`);
+    console.log(`Corrected: "${correctedText}"`);
 
     res.json({
       success: true,
-      results: results,
-      statistics: statistics,
-      dictionarySize: dictionary.length,
+      originalText: text,
+      correctedText: correctedText,
+      correctionCount: correctionCount,
+      corrections: corrections,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("Imlo tekshirish xatosi:", error);
+    console.error("❌ AUTO-CORRECT XATOSI:", error);
     res.status(500).json({
-      error: "Server xatosi yuz berdi",
-      message:
-        process.env.NODE_ENV === "development" ? error.message : undefined,
+      error: "Server xatosi",
+      message: error.message,
     });
   }
 });
 
-// POST /api/check/word - Bitta so'zni tekshirish
-router.post("/word", async (req, res) => {
-  try {
-    const { word } = req.body;
-
-    if (!word || typeof word !== "string") {
-      return res.status(400).json({
-        error: "So'z kiritilishi shart",
-      });
-    }
-
-    const normalizedWord = normalizeWord(word);
-
-    // So'zlar bazasini olish
-    const dictionary = await getDictionary();
-
-    // So'zni tekshirish
-    const isCorrect = dictionary.some(
-      (wordObj) => normalizeWord(wordObj.word) === normalizedWord
-    );
-
-    let suggestions = [];
-    if (!isCorrect) {
-      // Yaqin so'zlarni topish
-      const similarWords = fuzzySearch(word, dictionary, 5);
-      suggestions = similarWords.map((w) => ({
-        word: w.word,
-        score: w.score,
-        type: w.type,
-      }));
-    }
-
-    res.json({
-      success: true,
-      word: word,
-      isCorrect: isCorrect,
-      suggestions: suggestions,
-    });
-  } catch (error) {
-    console.error("So'z tekshirish xatosi:", error);
-    res.status(500).json({
-      error: "Server xatosi yuz berdi",
-    });
-  }
-});
-
-// GET /api/check/suggestions/:word - So'z uchun takliflar
-router.get("/suggestions/:word", async (req, res) => {
-  try {
-    const { word } = req.params;
-    const limit = parseInt(req.query.limit) || 10;
-
-    if (!word) {
-      return res.status(400).json({
-        error: "So'z parametri kiritilishi shart",
-      });
-    }
-
-    const dictionary = await getDictionary();
-    const suggestions = fuzzySearch(word, dictionary, limit);
-
-    res.json({
-      success: true,
-      word: word,
-      suggestions: suggestions,
-    });
-  } catch (error) {
-    console.error("Takliflar olish xatosi:", error);
-    res.status(500).json({
-      error: "Server xatosi yuz berdi",
-    });
-  }
-});
-
-// POST /api/check/batch - Ko'p so'zlarni bir vaqtda tekshirish
-router.post("/batch", async (req, res) => {
-  try {
-    const { words } = req.body;
-
-    if (!Array.isArray(words) || words.length === 0) {
-      return res.status(400).json({
-        error: "So'zlar massivi kiritilishi shart",
-      });
-    }
-
-    if (words.length > 1000) {
-      return res.status(400).json({
-        error: "Juda ko'p so'z (maksimal 1000 ta)",
-      });
-    }
-
-    const dictionary = await getDictionary();
-    const results = [];
-
-    for (const word of words) {
-      if (typeof word !== "string") continue;
-
-      const normalizedWord = normalizeWord(word);
-      const isCorrect = dictionary.some(
-        (wordObj) => normalizeWord(wordObj.word) === normalizedWord
-      );
-
-      let suggestions = [];
-      if (!isCorrect) {
-        const similarWords = fuzzySearch(word, dictionary, 3);
-        suggestions = similarWords.map((w) => w.word);
-      }
-
-      results.push({
-        word: word,
-        isCorrect: isCorrect,
-        suggestions: suggestions,
-      });
-    }
-
-    res.json({
-      success: true,
-      results: results,
-      totalChecked: results.length,
-    });
-  } catch (error) {
-    console.error("Batch tekshirish xatosi:", error);
-    res.status(500).json({
-      error: "Server xatosi yuz berdi",
-    });
-  }
-});
-
-// POST /api/check/refresh-cache - Cache yangilash (admin uchun)
+// Cache yangilash
 router.post("/refresh-cache", async (req, res) => {
   try {
     await getDictionary(true);
     res.json({
       success: true,
-      message: "Cache muvaffaqiyatli yangilandi",
+      message: "Dictionary cache yangilandi",
     });
   } catch (error) {
-    console.error("Cache yangilash xatosi:", error);
     res.status(500).json({
-      error: "Cache yangilashda xato",
+      error: "Cache yangilashda xato: " + error.message,
+    });
+  }
+});
+
+// GET /api/check/stats - Dictionary statistikasi
+router.get("/stats", async (req, res) => {
+  try {
+    const { map } = await getDictionary();
+
+    let cyrillicCount = 0;
+    let latinCount = 0;
+    let mixedCount = 0;
+
+    for (const [, wordInfo] of map) {
+      if (wordInfo.script === "cyrillic") cyrillicCount++;
+      else if (wordInfo.script === "latin") latinCount++;
+      else mixedCount++;
+    }
+
+    res.json({
+      success: true,
+      stats: {
+        totalWords: map.size,
+        cyrillic: cyrillicCount,
+        latin: latinCount,
+        mixed: mixedCount,
+        lastUpdate: cacheTimestamp
+          ? new Date(cacheTimestamp).toISOString()
+          : null,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Statistika olishda xato",
     });
   }
 });
