@@ -1,14 +1,56 @@
-// server.js - COMPLETE BACKEND SERVER WITH ALL FEATURES
+// server.js - UPDATED WITH AUTH AND PLANS
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import cookieParser from "cookie-parser";
 import Anthropic from "@anthropic-ai/sdk";
+
+// Utils and middleware imports
+import { connectDatabase } from "./utils/database.js";
+import { securityMiddlewares } from "./utils/security.js";
+import { performanceMonitor } from "./utils/performance.js";
+import { AppError } from "./utils/appError.js";
+import logger from "./utils/logger.js";
+
+// Routes imports
+import authRoutes from "./routes/authRoutes.js";
+import historyRoutes from "./routes/historyRoutes.js";
+
+// Controllers and middleware
+import {
+  protect,
+  checkDailyLimit,
+  incrementUsage,
+} from "./controllers/authController.js";
+import { saveToHistory } from "./controllers/historyController.js";
+import {
+  validateText,
+  validateDocumentGenerator,
+  validateSongGenerator,
+  validateTransliteration,
+} from "./middleware/validation.js";
+import {
+  rateLimitAPI,
+  rateLimitHeavy,
+  dynamicRateLimit,
+  getRateLimitInfo,
+} from "./middleware/rateLimiting.js";
 
 // Load environment variables
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 4343;
+
+// Connect to database
+connectDatabase();
+
+// Security middlewares
+securityMiddlewares(app);
+
+// Performance monitoring
+app.use(performanceMonitor);
+app.use(getRateLimitInfo);
 
 // API Key Debug
 console.log("🔍 API Key Debug:");
@@ -33,14 +75,23 @@ try {
   console.error("❌ Failed to initialize Anthropic client:", error);
 }
 
-// Middleware
-app.use(cors());
+// Basic middleware
+app.use(
+  cors({
+    origin: process.env.CLIENT_URL || "http://localhost:5173",
+    credentials: true,
+  })
+);
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
 
 // Logging middleware
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  logger.info(`${req.method} ${req.path}`, {
+    ip: req.ip,
+    userAgent: req.get("User-Agent"),
+  });
   next();
 });
 
@@ -139,13 +190,20 @@ const cleanAndParseJSON = (text) => {
 
 // Routes
 
+// Auth routes
+app.use("/api/auth", authRoutes);
+
+// History routes
+app.use("/api/history", historyRoutes);
+
 // Health check
 app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
-    service: "OrfoAI Backend",
+    service: "OrfoAI Backend with Auth",
     apiKeyConfigured: !!process.env.ANTHROPIC_API_KEY,
+    database: "connected",
   });
 });
 
@@ -205,218 +263,39 @@ app.get("/api/test-connection", async (req, res) => {
   }
 });
 
-app.post("/api/spell-check", async (req, res) => {
-  console.log("📝 Spell check request received");
+// PROTECTED API ENDPOINTS - Require authentication and check limits
 
-  try {
-    const { text, language = "uz", script } = req.body;
+// Spell check endpoint - PROTECTED
+app.post(
+  "/api/spell-check",
+  rateLimitHeavy,
+  protect,
+  checkDailyLimit("spellCheck"),
+  validateText,
+  saveToHistory("spellCheck"),
+  async (req, res) => {
+    console.log("📝 Spell check request received");
 
-    if (!text || !text.trim()) {
-      return res.status(400).json({
-        success: false,
-        error: "Text is required",
-      });
-    }
+    try {
+      const { text, language = "uz", script } = req.body;
 
-    const detectedScript = script || detectScript(text);
-    const languageMap = {
-      uz: "Uzbek",
-      kaa: "Karakalpak",
-      ru: "Russian",
-    };
-    const languageName = languageMap[language] || "Karakalpak";
-    const scriptName =
-      detectedScript === "latin" || detectedScript === "mixed"
-        ? "Latin"
-        : "Cyrillic";
-
-    // Use the same prompt as correction for consistency
-    let correctionPrompt = "";
-
-    if (language === "uz") {
-      correctionPrompt = `You are an Uzbek language corrector. Correct all spelling and grammar errors in the following Uzbek text. 
-
-TEXT TO CORRECT: "${text}"
-
-RULES:
-- ONLY return the corrected Uzbek text
-- NO explanations, NO comments, NO additional text
-- Keep the same meaning and structure
-- Use ${scriptName} script
-- Fix spelling and grammar errors only
-- Do NOT translate to other languages
-- Do NOT add any English text or explanations
-
-CORRECTED TEXT:`;
-    } else if (language === "kaa") {
-      correctionPrompt = `You are a Karakalpak language corrector. Correct all spelling and grammar errors in the following Karakalpak text.
-
-TEXT TO CORRECT: "${text}"
-
-RULES:
-- ONLY return the corrected Karakalpak text
-- NO explanations, NO comments, NO additional text  
-- Keep the same meaning and structure
-- Use ${scriptName} script
-- Fix spelling and grammar errors only
-- Do NOT translate to other languages
-- Do NOT add any English text or explanations
-
-CORRECTED TEXT:`;
-    } else {
-      correctionPrompt = `You are a ${languageName} language corrector. Correct all spelling and grammar errors in the following text.
-
-TEXT TO CORRECT: "${text}"
-
-RULES:
-- ONLY return the corrected ${languageName} text
-- NO explanations, NO comments, NO additional text
-- Keep the same meaning and structure  
-- Use ${scriptName} script
-- Fix spelling and grammar errors only
-- Do NOT translate to other languages
-- Do NOT add any English text or explanations
-
-CORRECTED TEXT:`;
-    }
-
-    console.log("📤 Getting corrected text...");
-    const rawResponse = await sendClaudeRequest(correctionPrompt);
-
-    // Apply same cleaning logic as correction endpoint
-    let correctedText = rawResponse.trim();
-
-    // Remove explanations
-    const explanationPatterns = [
-      /^I apologize.*$/gim,
-      /^Please let me know.*$/gim,
-      /^Would you like me to.*$/gim,
-      /^For.*correction.*$/gim,
-      /^The text.*$/gim,
-      /^These are.*$/gim,
-      /^[123]\.\s.*$/gim,
-      /^CORRECTED TEXT:\s*/gim,
-      /^CORRECTED:\s*/gim,
-      /^Here.*$/gim,
-      /^Note:.*$/gim,
-    ];
-
-    explanationPatterns.forEach((pattern) => {
-      correctedText = correctedText.replace(pattern, "");
-    });
-
-    correctedText = correctedText
-      .replace(/\n{2,}/g, "\n")
-      .replace(/^\s*\n/gm, "")
-      .trim();
-
-    // Simple word-by-word comparison for spell check
-    const originalWords = text.trim().split(/\s+/);
-    const correctedWords = correctedText.trim().split(/\s+/);
-
-    const results = [];
-    const errors = [];
-
-    for (let i = 0; i < originalWords.length; i++) {
-      const originalWord = originalWords[i];
-      const correctedWord = correctedWords[i] || originalWord;
-
-      const cleanOriginal = originalWord.replace(/[.,!?;:"'()]/g, "");
-      const cleanCorrected = correctedWord.replace(/[.,!?;:"'()]/g, "");
-
-      const beforeText = originalWords.slice(0, i).join(" ");
-      const wordStart = beforeText.length + (beforeText ? 1 : 0);
-      const wordEnd = wordStart + originalWord.length;
-
-      const isCorrect =
-        cleanOriginal.toLowerCase() === cleanCorrected.toLowerCase();
-
-      const result = {
-        word: cleanOriginal,
-        isCorrect: isCorrect,
-        suggestions: isCorrect ? [] : [cleanCorrected],
-        start: wordStart,
-        end: wordEnd,
+      const detectedScript = script || detectScript(text);
+      const languageMap = {
+        uz: "Uzbek",
+        kaa: "Karakalpak",
+        ru: "Russian",
       };
+      const languageName = languageMap[language] || "Karakalpak";
+      const scriptName =
+        detectedScript === "latin" || detectedScript === "mixed"
+          ? "Latin"
+          : "Cyrillic";
 
-      results.push(result);
+      // Use the same prompt as correction for consistency
+      let correctionPrompt = "";
 
-      if (!isCorrect) {
-        errors.push({
-          mistakeWord: cleanOriginal,
-          similarWords: [
-            {
-              word: cleanCorrected,
-              similarity: 95,
-            },
-          ],
-        });
-      }
-    }
-
-    const totalWords = originalWords.length;
-    const incorrectWords = errors.length;
-    const correctWords = totalWords - incorrectWords;
-    const accuracy =
-      totalWords > 0 ? ((correctWords / totalWords) * 100).toFixed(1) : 100;
-
-    res.json({
-      success: true,
-      data: {
-        results: results,
-        statistics: {
-          totalWords,
-          correctWords,
-          incorrectWords,
-          accuracy: parseFloat(accuracy),
-          textLength: text.length,
-          scriptType: detectedScript,
-          language: language,
-          languageName: languageName,
-        },
-        correctedVersion: correctedText,
-      },
-    });
-  } catch (error) {
-    console.error("❌ Spell check error:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || "Spell check failed",
-    });
-  }
-});
-
-// Keep the existing correct-text endpoint but make it use the same logic
-// Fixed AI correction prompts - No explanations, only corrected text
-app.post("/api/correct-text", async (req, res) => {
-  try {
-    const { text, language = "uz", script } = req.body;
-
-    if (!text || !text.trim()) {
-      return res.status(400).json({
-        success: false,
-        error: "Text is required",
-      });
-    }
-
-    const detectedScript = script || detectScript(text);
-    const scriptName =
-      detectedScript === "latin" || detectedScript === "mixed"
-        ? "Latin"
-        : "Cyrillic";
-
-    const languageMap = {
-      uz: "Uzbek",
-      kaa: "Karakalpak",
-      ru: "Russian",
-    };
-
-    const languageName = languageMap[language] || "Karakalpak";
-
-    let prompt = "";
-
-    if (language === "uz") {
-      prompt = `You are an Uzbek language corrector. Correct all spelling and grammar errors in the following Uzbek text. 
+      if (language === "uz") {
+        correctionPrompt = `You are an Uzbek language corrector. Correct all spelling and grammar errors in the following Uzbek text. 
 
 TEXT TO CORRECT: "${text}"
 
@@ -430,8 +309,8 @@ RULES:
 - Do NOT add any English text or explanations
 
 CORRECTED TEXT:`;
-    } else if (language === "kaa") {
-      prompt = `You are a Karakalpak language corrector. Correct all spelling and grammar errors in the following Karakalpak text.
+      } else if (language === "kaa") {
+        correctionPrompt = `You are a Karakalpak language corrector. Correct all spelling and grammar errors in the following Karakalpak text.
 
 TEXT TO CORRECT: "${text}"
 
@@ -445,8 +324,8 @@ RULES:
 - Do NOT add any English text or explanations
 
 CORRECTED TEXT:`;
-    } else {
-      prompt = `You are a ${languageName} language corrector. Correct all spelling and grammar errors in the following text.
+      } else {
+        correctionPrompt = `You are a ${languageName} language corrector. Correct all spelling and grammar errors in the following text.
 
 TEXT TO CORRECT: "${text}"
 
@@ -460,153 +339,407 @@ RULES:
 - Do NOT add any English text or explanations
 
 CORRECTED TEXT:`;
-    }
+      }
 
-    console.log("📤 Sending correction request to Claude...");
-    const rawResponse = await sendClaudeRequest(prompt);
-    console.log("📥 Raw Claude response:", rawResponse);
+      console.log("📤 Getting corrected text...");
+      const rawResponse = await sendClaudeRequest(correctionPrompt);
 
-    // Clean the response - remove any explanations
-    let correctedText = rawResponse.trim();
+      // Apply same cleaning logic as correction endpoint
+      let correctedText = rawResponse.trim();
 
-    // Remove common explanation patterns
-    const explanationPatterns = [
-      /^I apologize.*$/gim,
-      /^Please let me know.*$/gim,
-      /^Would you like me to.*$/gim,
-      /^For.*correction.*$/gim,
-      /^The text.*$/gim,
-      /^These are.*$/gim,
-      /^[123]\.\s.*$/gim, // Remove numbered lists
-      /^CORRECTED TEXT:\s*/gim,
-      /^CORRECTED:\s*/gim,
-      /^Here.*$/gim,
-      /^Note:.*$/gim,
-      /^This text.*$/gim,
-    ];
-
-    // Apply cleaning patterns
-    explanationPatterns.forEach((pattern) => {
-      correctedText = correctedText.replace(pattern, "");
-    });
-
-    // Remove multiple newlines and trim
-    correctedText = correctedText
-      .replace(/\n{2,}/g, "\n")
-      .replace(/^\s*\n/gm, "")
-      .trim();
-
-    // If response is too long compared to original (likely contains explanations), try extraction
-    if (correctedText.length > text.length * 2) {
-      console.log("⚠️ Response too long, extracting core text...");
-
-      // Try to find the actual corrected text (usually in quotes or after certain patterns)
-      const patterns = [
-        /"([^"]+)"/g, // Text in quotes
-        /TEXT:\s*(.+)/gi, // After "TEXT:"
-        /CORRECTED:\s*(.+)/gi, // After "CORRECTED:"
+      // Remove explanations
+      const explanationPatterns = [
+        /^I apologize.*$/gim,
+        /^Please let me know.*$/gim,
+        /^Would you like me to.*$/gim,
+        /^For.*correction.*$/gim,
+        /^The text.*$/gim,
+        /^These are.*$/gim,
+        /^[123]\.\s.*$/gim,
+        /^CORRECTED TEXT:\s*/gim,
+        /^CORRECTED:\s*/gim,
+        /^Here.*$/gim,
+        /^Note:.*$/gim,
       ];
 
-      for (const pattern of patterns) {
-        const matches = correctedText.match(pattern);
-        if (matches && matches[0]) {
-          const extracted = matches[0]
-            .replace(/^(TEXT|CORRECTED):\s*/gi, "")
-            .replace(/^"|"$/g, "")
-            .trim();
+      explanationPatterns.forEach((pattern) => {
+        correctedText = correctedText.replace(pattern, "");
+      });
 
-          if (extracted.length > 10 && extracted.length < text.length * 1.5) {
-            correctedText = extracted;
-            break;
+      correctedText = correctedText
+        .replace(/\n{2,}/g, "\n")
+        .replace(/^\s*\n/gm, "")
+        .trim();
+
+      // Simple word-by-word comparison for spell check
+      const originalWords = text.trim().split(/\s+/);
+      const correctedWords = correctedText.trim().split(/\s+/);
+
+      const results = [];
+      const errors = [];
+
+      for (let i = 0; i < originalWords.length; i++) {
+        const originalWord = originalWords[i];
+        const correctedWord = correctedWords[i] || originalWord;
+
+        const cleanOriginal = originalWord.replace(/[.,!?;:"'()]/g, "");
+        const cleanCorrected = correctedWord.replace(/[.,!?;:"'()]/g, "");
+
+        const beforeText = originalWords.slice(0, i).join(" ");
+        const wordStart = beforeText.length + (beforeText ? 1 : 0);
+        const wordEnd = wordStart + originalWord.length;
+
+        const isCorrect =
+          cleanOriginal.toLowerCase() === cleanCorrected.toLowerCase();
+
+        const result = {
+          word: cleanOriginal,
+          isCorrect: isCorrect,
+          suggestions: isCorrect ? [] : [cleanCorrected],
+          start: wordStart,
+          end: wordEnd,
+        };
+
+        results.push(result);
+
+        if (!isCorrect) {
+          errors.push({
+            mistakeWord: cleanOriginal,
+            similarWords: [
+              {
+                word: cleanCorrected,
+                similarity: 95,
+              },
+            ],
+          });
+        }
+      }
+
+      const totalWords = originalWords.length;
+      const incorrectWords = errors.length;
+      const correctWords = totalWords - incorrectWords;
+      const accuracy =
+        totalWords > 0 ? ((correctWords / totalWords) * 100).toFixed(1) : 100;
+
+      // Increment usage after successful operation
+      await req.user.incrementUsage("spellCheck");
+
+      res.json({
+        success: true,
+        data: {
+          results: results,
+          statistics: {
+            totalWords,
+            correctWords,
+            incorrectWords,
+            accuracy: parseFloat(accuracy),
+            textLength: text.length,
+            scriptType: detectedScript,
+            language: language,
+            languageName: languageName,
+          },
+          correctedVersion: correctedText,
+        },
+      });
+    } catch (error) {
+      console.error("❌ Spell check error:", error);
+      res.status(500).json({
+        success: false,
+        error: error.message || "Spell check failed",
+      });
+    }
+  }
+);
+
+// Text correction endpoint - PROTECTED
+app.post(
+  "/api/correct-text",
+  rateLimitHeavy,
+  protect,
+  checkDailyLimit("correctText"),
+  validateText,
+  saveToHistory("correctText"),
+  incrementUsage("correctText"),
+  async (req, res) => {
+    try {
+      const { text, language = "uz", script } = req.body;
+
+      const detectedScript = script || detectScript(text);
+      const scriptName =
+        detectedScript === "latin" || detectedScript === "mixed"
+          ? "Latin"
+          : "Cyrillic";
+
+      const languageMap = {
+        uz: "Uzbek",
+        kaa: "Karakalpak",
+        ru: "Russian",
+      };
+
+      const languageName = languageMap[language] || "Karakalpak";
+
+      let prompt = "";
+
+      if (language === "uz") {
+        prompt = `You are an Uzbek language corrector. Correct all spelling and grammar errors in the following Uzbek text. 
+
+TEXT TO CORRECT: "${text}"
+
+RULES:
+- ONLY return the corrected Uzbek text
+- NO explanations, NO comments, NO additional text
+- Keep the same meaning and structure
+- Use ${scriptName} script
+- Fix spelling and grammar errors only
+- Do NOT translate to other languages
+- Do NOT add any English text or explanations
+
+CORRECTED TEXT:`;
+      } else if (language === "kaa") {
+        prompt = `You are a Karakalpak language corrector. Correct all spelling and grammar errors in the following Karakalpak text.
+
+TEXT TO CORRECT: "${text}"
+
+RULES:
+- ONLY return the corrected Karakalpak text
+- NO explanations, NO comments, NO additional text  
+- Keep the same meaning and structure
+- Use ${scriptName} script
+- Fix spelling and grammar errors only
+- Do NOT translate to other languages
+- Do NOT add any English text or explanations
+
+CORRECTED TEXT:`;
+      } else {
+        prompt = `You are a ${languageName} language corrector. Correct all spelling and grammar errors in the following text.
+
+TEXT TO CORRECT: "${text}"
+
+RULES:
+- ONLY return the corrected ${languageName} text
+- NO explanations, NO comments, NO additional text
+- Keep the same meaning and structure  
+- Use ${scriptName} script
+- Fix spelling and grammar errors only
+- Do NOT translate to other languages
+- Do NOT add any English text or explanations
+
+CORRECTED TEXT:`;
+      }
+
+      console.log("📤 Sending correction request to Claude...");
+      const rawResponse = await sendClaudeRequest(prompt);
+      console.log("📥 Raw Claude response:", rawResponse);
+
+      // Clean the response - remove any explanations
+      let correctedText = rawResponse.trim();
+
+      // Remove common explanation patterns
+      const explanationPatterns = [
+        /^I apologize.*$/gim,
+        /^Please let me know.*$/gim,
+        /^Would you like me to.*$/gim,
+        /^For.*correction.*$/gim,
+        /^The text.*$/gim,
+        /^These are.*$/gim,
+        /^[123]\.\s.*$/gim, // Remove numbered lists
+        /^CORRECTED TEXT:\s*/gim,
+        /^CORRECTED:\s*/gim,
+        /^Here.*$/gim,
+        /^Note:.*$/gim,
+        /^This text.*$/gim,
+      ];
+
+      // Apply cleaning patterns
+      explanationPatterns.forEach((pattern) => {
+        correctedText = correctedText.replace(pattern, "");
+      });
+
+      // Remove multiple newlines and trim
+      correctedText = correctedText
+        .replace(/\n{2,}/g, "\n")
+        .replace(/^\s*\n/gm, "")
+        .trim();
+
+      // If response is too long compared to original (likely contains explanations), try extraction
+      if (correctedText.length > text.length * 2) {
+        console.log("⚠️ Response too long, extracting core text...");
+
+        // Try to find the actual corrected text (usually in quotes or after certain patterns)
+        const patterns = [
+          /"([^"]+)"/g, // Text in quotes
+          /TEXT:\s*(.+)/gi, // After "TEXT:"
+          /CORRECTED:\s*(.+)/gi, // After "CORRECTED:"
+        ];
+
+        for (const pattern of patterns) {
+          const matches = correctedText.match(pattern);
+          if (matches && matches[0]) {
+            const extracted = matches[0]
+              .replace(/^(TEXT|CORRECTED):\s*/gi, "")
+              .replace(/^"|"$/g, "")
+              .trim();
+
+            if (extracted.length > 10 && extracted.length < text.length * 1.5) {
+              correctedText = extracted;
+              break;
+            }
           }
         }
       }
-    }
 
-    // Final check - if still contains explanations, use fallback
-    const englishWords = correctedText.match(
-      /\b(the|and|or|in|at|to|for|of|with|by)\b/gi
-    );
-    if (englishWords && englishWords.length > 2) {
-      console.log("⚠️ Response contains English, using fallback approach...");
+      // Final check - if still contains explanations, use fallback
+      const englishWords = correctedText.match(
+        /\b(the|and|or|in|at|to|for|of|with|by)\b/gi
+      );
+      if (englishWords && englishWords.length > 2) {
+        console.log("⚠️ Response contains English, using fallback approach...");
 
-      // Fallback: Use a more strict prompt
-      const fallbackPrompt = `Fix spelling errors in this ${languageName} text and return ONLY the fixed text, nothing else: "${text}"`;
+        // Fallback: Use a more strict prompt
+        const fallbackPrompt = `Fix spelling errors in this ${languageName} text and return ONLY the fixed text, nothing else: "${text}"`;
 
-      try {
-        const fallbackResponse = await sendClaudeRequest(fallbackPrompt);
-        const cleaned = fallbackResponse.trim().replace(/^"|"$/g, "");
-        if (cleaned.length > 5 && cleaned.length < text.length * 2) {
-          correctedText = cleaned;
+        try {
+          const fallbackResponse = await sendClaudeRequest(fallbackPrompt);
+          const cleaned = fallbackResponse.trim().replace(/^"|"$/g, "");
+          if (cleaned.length > 5 && cleaned.length < text.length * 2) {
+            correctedText = cleaned;
+          }
+        } catch (fallbackError) {
+          console.warn("Fallback correction failed:", fallbackError.message);
         }
-      } catch (fallbackError) {
-        console.warn("Fallback correction failed:", fallbackError.message);
       }
-    }
 
-    // If all cleaning failed, return original text
-    if (!correctedText || correctedText.length < 5) {
-      console.log("⚠️ Correction failed, returning original text");
-      correctedText = text;
-    }
+      // If all cleaning failed, return original text
+      if (!correctedText || correctedText.length < 5) {
+        console.log("⚠️ Correction failed, returning original text");
+        correctedText = text;
+      }
 
-    console.log("✅ Final corrected text:", correctedText);
+      console.log("✅ Final corrected text:", correctedText);
 
-    res.json({
-      success: true,
-      data: {
-        original: text,
-        corrected: correctedText,
-        language: language,
-        languageName: languageName,
-        script: detectedScript,
-      },
-    });
-  } catch (error) {
-    console.error("Text correction error:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || "Text correction failed",
-    });
-  }
-});
-
-// Transliteration endpoint
-app.post("/api/transliterate", async (req, res) => {
-  try {
-    const { text, targetScript, language = "kaa" } = req.body;
-
-    if (!text || !text.trim()) {
-      return res.status(400).json({
-        success: false,
-        error: "Text is required",
-      });
-    }
-
-    const sourceScript = detectScript(text);
-
-    if (sourceScript === targetScript) {
-      return res.json({
+      res.json({
         success: true,
         data: {
           original: text,
-          converted: text,
+          corrected: correctedText,
+          language: language,
+          languageName: languageName,
+          script: detectedScript,
+        },
+      });
+    } catch (error) {
+      console.error("Text correction error:", error);
+      res.status(500).json({
+        success: false,
+        error: error.message || "Text correction failed",
+      });
+    }
+  }
+);
+
+// Transliteration endpoint - PROTECTED
+app.post(
+  "/api/transliterate",
+  rateLimitAPI,
+  protect,
+  checkDailyLimit("transliterate"),
+  validateTransliteration,
+  saveToHistory("transliterate"),
+  incrementUsage("transliterate"),
+  async (req, res) => {
+    try {
+      const { text, targetScript, language = "kaa" } = req.body;
+
+      const sourceScript = detectScript(text);
+
+      if (sourceScript === targetScript) {
+        return res.json({
+          success: true,
+          data: {
+            original: text,
+            converted: text,
+            from: sourceScript,
+            to: targetScript,
+          },
+        });
+      }
+
+      const isToLatin = targetScript === "latin";
+      const languageName =
+        language === "kaa"
+          ? "Karakalpak"
+          : language === "uz"
+          ? "Uzbek"
+          : "Russian";
+
+      const prompt = isToLatin
+        ? `Convert this ${languageName} text from Cyrillic to Latin script.
+
+Text: "${text}"
+Language: ${languageName}
+
+Conversion rules for ${languageName}:
+а→a, ә→ә, б→b, в→v, г→g, ғ→ğ, д→d, е→e, ё→yo, ж→j, з→z, и→i, й→y, к→k, қ→q, л→l, м→m, н→n, ң→ń, о→o, ө→ö, п→p, р→r, с→s, т→t, у→u, ү→ü, ў→w, ф→f, х→x, ҳ→h, ц→c, ч→ch, ш→sh, щ→shh, ъ→', ы→ı, ь→', э→e, ю→yu, я→ya
+
+Return only the converted text in Latin script, nothing else.`
+        : `Convert this ${languageName} text from Latin to Cyrillic script.
+
+Text: "${text}"
+Language: ${languageName}
+
+Conversion rules for ${languageName}:
+a→а, ә→ә, b→б, v→в, g→г, ğ→ғ, d→д, e→е, j→ж, z→з, i→и, ı→ы, y→й, k→к, q→қ, l→л, m→м, n→н, ń→ң, o→о, ö→ө, p→п, r→р, s→с, t→т, u→у, ü→ү, w→ў, f→ф, x→х, h→ҳ, c→ц, ch→ч, sh→ш, yu→ю, ya→я
+
+Return only the converted text in Cyrillic script, nothing else.`;
+
+      const convertedText = await sendClaudeRequest(prompt);
+
+      res.json({
+        success: true,
+        data: {
+          original: text,
+          converted: convertedText.trim(),
           from: sourceScript,
           to: targetScript,
         },
       });
+    } catch (error) {
+      console.error("Transliteration error:", error);
+      res.status(500).json({
+        success: false,
+        error: error.message || "Transliteration failed",
+      });
     }
+  }
+);
 
-    const isToLatin = targetScript === "latin";
-    const languageName =
-      language === "kaa"
-        ? "Karakalpak"
-        : language === "uz"
-        ? "Uzbek"
-        : "Russian";
+// Auto transliteration endpoint - PROTECTED
+app.post(
+  "/api/auto-transliterate",
+  rateLimitAPI,
+  protect,
+  checkDailyLimit("transliterate"),
+  validateText,
+  saveToHistory("transliterate"),
+  incrementUsage("transliterate"),
+  async (req, res) => {
+    try {
+      const { text, language = "kaa" } = req.body;
 
-    const prompt = isToLatin
-      ? `Convert this ${languageName} text from Cyrillic to Latin script.
+      const sourceScript = detectScript(text);
+      const targetScript = sourceScript === "cyrillic" ? "latin" : "cyrillic";
+
+      // Use the transliterate endpoint logic
+      const isToLatin = targetScript === "latin";
+      const languageName =
+        language === "kaa"
+          ? "Karakalpak"
+          : language === "uz"
+          ? "Uzbek"
+          : "Russian";
+
+      const prompt = isToLatin
+        ? `Convert this ${languageName} text from Cyrillic to Latin script.
 
 Text: "${text}"
 Language: ${languageName}
@@ -615,7 +748,7 @@ Conversion rules for ${languageName}:
 а→a, ә→ә, б→b, в→v, г→g, ғ→ğ, д→d, е→e, ё→yo, ж→j, з→z, и→i, й→y, к→k, қ→q, л→l, м→m, н→n, ң→ń, о→o, ө→ö, п→p, р→r, с→s, т→t, у→u, ү→ü, ў→w, ф→f, х→x, ҳ→h, ц→c, ч→ch, ш→sh, щ→shh, ъ→', ы→ı, ь→', э→e, ю→yu, я→ya
 
 Return only the converted text in Latin script, nothing else.`
-      : `Convert this ${languageName} text from Latin to Cyrillic script.
+        : `Convert this ${languageName} text from Latin to Cyrillic script.
 
 Text: "${text}"
 Language: ${languageName}
@@ -625,137 +758,75 @@ a→а, ә→ә, b→б, v→в, g→г, ğ→ғ, d→д, e→е, j→ж, z→з
 
 Return only the converted text in Cyrillic script, nothing else.`;
 
-    const convertedText = await sendClaudeRequest(prompt);
+      const convertedText = await sendClaudeRequest(prompt);
 
-    res.json({
-      success: true,
-      data: {
-        original: text,
-        converted: convertedText.trim(),
-        from: sourceScript,
-        to: targetScript,
-      },
-    });
-  } catch (error) {
-    console.error("Transliteration error:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || "Transliteration failed",
-    });
-  }
-});
-
-// Auto transliteration endpoint
-app.post("/api/auto-transliterate", async (req, res) => {
-  try {
-    const { text, language = "kaa" } = req.body;
-
-    if (!text || !text.trim()) {
-      return res.status(400).json({
+      res.json({
+        success: true,
+        data: {
+          original: text,
+          converted: convertedText.trim(),
+          from: sourceScript,
+          to: targetScript,
+        },
+      });
+    } catch (error) {
+      console.error("Auto transliteration error:", error);
+      res.status(500).json({
         success: false,
-        error: "Text is required",
+        error: error.message || "Auto transliteration failed",
       });
     }
-
-    const sourceScript = detectScript(text);
-    const targetScript = sourceScript === "cyrillic" ? "latin" : "cyrillic";
-
-    // Use the transliterate endpoint logic
-    const isToLatin = targetScript === "latin";
-    const languageName =
-      language === "kaa"
-        ? "Karakalpak"
-        : language === "uz"
-        ? "Uzbek"
-        : "Russian";
-
-    const prompt = isToLatin
-      ? `Convert this ${languageName} text from Cyrillic to Latin script.
-
-Text: "${text}"
-Language: ${languageName}
-
-Conversion rules for ${languageName}:
-а→a, ә→ә, б→b, в→v, г→g, ғ→ğ, д→d, е→e, ё→yo, ж→j, з→z, и→i, й→y, к→k, қ→q, л→l, м→m, н→n, ң→ń, о→o, ө→ö, п→p, р→r, с→s, т→t, у→u, ү→ü, ў→w, ф→f, х→x, ҳ→h, ц→c, ч→ch, ш→sh, щ→shh, ъ→', ы→ı, ь→', э→e, ю→yu, я→ya
-
-Return only the converted text in Latin script, nothing else.`
-      : `Convert this ${languageName} text from Latin to Cyrillic script.
-
-Text: "${text}"
-Language: ${languageName}
-
-Conversion rules for ${languageName}:
-a→а, ә→ә, b→б, v→в, g→г, ğ→ғ, d→д, e→е, j→ж, z→з, i→и, ı→ы, y→й, k→к, q→қ, l→л, m→м, n→н, ń→ң, o→о, ö→ө, p→п, r→р, s→с, t→т, u→у, ü→ү, w→ў, f→ф, x→х, h→ҳ, c→ц, ch→ч, sh→ш, yu→ю, ya→я
-
-Return only the converted text in Cyrillic script, nothing else.`;
-
-    const convertedText = await sendClaudeRequest(prompt);
-
-    res.json({
-      success: true,
-      data: {
-        original: text,
-        converted: convertedText.trim(),
-        from: sourceScript,
-        to: targetScript,
-      },
-    });
-  } catch (error) {
-    console.error("Auto transliteration error:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || "Auto transliteration failed",
-    });
   }
-});
+);
 
-// Text improvement endpoint
-app.post("/api/improve-text", async (req, res) => {
-  try {
-    const {
-      text,
-      language = "uz",
-      script = "latin",
-      style = "professional",
-      level = 3,
-    } = req.body;
+// Text improvement endpoint - PROTECTED
+app.post(
+  "/api/improve-text",
+  rateLimitHeavy,
+  protect,
+  checkDailyLimit("documentGenerator"),
+  validateDocumentGenerator,
+  saveToHistory("documentGenerator"),
+  incrementUsage("documentGenerator"),
+  async (req, res) => {
+    try {
+      const {
+        text,
+        language = "uz",
+        script = "latin",
+        style = "professional",
+        level = 3,
+      } = req.body;
 
-    if (!text || !text.trim()) {
-      return res.status(400).json({
-        success: false,
-        error: "Text is required",
-      });
-    }
+      const languageMap = {
+        uz: "Uzbek",
+        kaa: "Karakalpak",
+        ru: "Russian",
+      };
 
-    const languageMap = {
-      uz: "Uzbek",
-      kaa: "Karakalpak",
-      ru: "Russian",
-    };
+      const styleMap = {
+        professional: "professional and formal",
+        academic: "academic and scientific",
+        literary: "literary and beautiful",
+        formal: "formal and strict",
+        friendly: "friendly and warm",
+        humorous: "humorous and entertaining",
+      };
 
-    const styleMap = {
-      professional: "professional and formal",
-      academic: "academic and scientific",
-      literary: "literary and beautiful",
-      formal: "formal and strict",
-      friendly: "friendly and warm",
-      humorous: "humorous and entertaining",
-    };
+      const levelMap = {
+        1: "minimal changes - only most necessary",
+        2: "light improvement",
+        3: "moderate improvement",
+        4: "strong improvement",
+        5: "maximum improvement - complete rewrite",
+      };
 
-    const levelMap = {
-      1: "minimal changes - only most necessary",
-      2: "light improvement",
-      3: "moderate improvement",
-      4: "strong improvement",
-      5: "maximum improvement - complete rewrite",
-    };
+      const languageName = languageMap[language];
+      const styleDesc = styleMap[style] || styleMap.professional;
+      const levelDesc = levelMap[level] || levelMap[3];
+      const scriptName = script === "cyrillic" ? "CYRILLIC" : "LATIN";
 
-    const languageName = languageMap[language];
-    const styleDesc = styleMap[style] || styleMap.professional;
-    const levelDesc = levelMap[level] || levelMap[3];
-    const scriptName = script === "cyrillic" ? "CYRILLIC" : "LATIN";
-
-    const prompt = `You are a professional text editor and writer. Improve and perfect the following text.
+      const prompt = `You are a professional text editor and writer. Improve and perfect the following text.
 
 Original text: "${text}"
 Language: ${languageName}
@@ -784,71 +855,73 @@ IMPORTANT: Write the response in ${scriptName} script!
 
 Return only the improved text, no additional explanations.`;
 
-    const improvedText = await sendClaudeRequest(prompt);
+      const improvedText = await sendClaudeRequest(prompt);
 
-    res.json({
-      success: true,
-      data: {
-        original: text,
-        improved: improvedText.trim(),
-        language: language,
-        script: script,
-        style: style,
-        level: level,
-        improved_at: new Date().toISOString(),
-      },
-    });
-  } catch (error) {
-    console.error("Text improvement error:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || "Text improvement failed",
-    });
-  }
-});
-
-// Song generation endpoint
-app.post("/api/generate-song", async (req, res) => {
-  try {
-    const {
-      topic,
-      style = "classik",
-      language = "uz",
-      script = "latin",
-      conditions = "",
-    } = req.body;
-
-    if (!topic || !topic.trim()) {
-      return res.status(400).json({
+      res.json({
+        success: true,
+        data: {
+          original: text,
+          improved: improvedText.trim(),
+          language: language,
+          script: script,
+          style: style,
+          level: level,
+          improved_at: new Date().toISOString(),
+        },
+      });
+    } catch (error) {
+      console.error("Text improvement error:", error);
+      res.status(500).json({
         success: false,
-        error: "Topic is required",
+        error: error.message || "Text improvement failed",
       });
     }
+  }
+);
 
-    const styleMap = {
-      classik: "classic traditional style",
-      rep: "modern rap style",
-      adabiy: "beautiful literary style",
-      dardli: "emotional and melancholic style",
-      hkz: "folk song style",
-    };
+// Song generation endpoint - PROTECTED
+app.post(
+  "/api/generate-song",
+  rateLimitHeavy,
+  protect,
+  checkDailyLimit("documentGenerator"), // Same limit as document generator
+  validateSongGenerator,
+  saveToHistory("generateSong"),
+  incrementUsage("documentGenerator"),
+  async (req, res) => {
+    try {
+      const {
+        topic,
+        style = "classik",
+        language = "uz",
+        script = "latin",
+        conditions = "",
+      } = req.body;
 
-    const languageMap = {
-      uz: "Uzbek",
-      kaa: "Karakalpak",
-      ru: "Russian",
-    };
+      const styleMap = {
+        classik: "classic traditional style",
+        rep: "modern rap style",
+        adabiy: "beautiful literary style",
+        dardli: "emotional and melancholic style",
+        hkz: "folk song style",
+      };
 
-    const styleDesc = styleMap[style] || styleMap.classik;
-    const languageName = languageMap[language] || "Karakalpak";
-    const scriptName = script === "cyrillic" ? "CYRILLIC" : "LATIN";
+      const languageMap = {
+        uz: "Uzbek",
+        kaa: "Karakalpak",
+        ru: "Russian",
+      };
 
-    console.log(
-      `🎵 Song generation started: ${topic} in ${languageName} (${scriptName}) - ${styleDesc}`
-    );
+      const styleDesc = styleMap[style] || styleMap.classik;
+      const languageName = languageMap[language] || "Karakalpak";
+      const scriptName = script === "cyrillic" ? "CYRILLIC" : "LATIN";
 
-    // Stage 1: Song creation
-    const songPrompt = `You are a professional songwriter and poet. Create a professional song based on the following information.
+      console.log(
+        `🎵 Song generation started: ${topic} in ${languageName} (${scriptName}) - ${styleDesc}`
+      );
+
+      // Stage 1: Song creation
+      const songPrompt = `You are a professional songwriter and poet. Create a professional song based on the following information.
 
 Topic: "${topic}"
 Style: ${styleDesc}
@@ -917,24 +990,24 @@ Format:
 
 MUSIC RECOMMENDATION: [Suitable music genre, tempo, and instrumentation suggestions]`;
 
-    console.log("📝 Stage 1: Generating song...");
-    const initialContent = await sendClaudeRequest(songPrompt);
+      console.log("📝 Stage 1: Generating song...");
+      const initialContent = await sendClaudeRequest(songPrompt);
 
-    // Separate song and music recommendation
-    const parts = initialContent.split(/MUSIC RECOMMENDATION:/i);
-    let song = parts[0]?.trim() || initialContent;
-    const recommendedMusic =
-      parts[1]?.trim() || "Traditional folk melody with modern arrangement";
+      // Separate song and music recommendation
+      const parts = initialContent.split(/MUSIC RECOMMENDATION:/i);
+      let song = parts[0]?.trim() || initialContent;
+      const recommendedMusic =
+        parts[1]?.trim() || "Traditional folk melody with modern arrangement";
 
-    console.log("✅ Stage 1 completed. Generated song length:", song.length);
+      console.log("✅ Stage 1 completed. Generated song length:", song.length);
 
-    // Stage 2: Spell checking and refinement for Karakalpak and Uzbek
-    if (language === "kaa" || language === "uz") {
-      console.log(
-        `🔍 Stage 2: ${languageName} spell checking and refinement...`
-      );
+      // Stage 2: Spell checking and refinement for Karakalpak and Uzbek
+      if (language === "kaa" || language === "uz") {
+        console.log(
+          `🔍 Stage 2: ${languageName} spell checking and refinement...`
+        );
 
-      const spellCheckPrompt = `You are a professional ${languageName} language editor and spell-checker. Review and perfect the following song text in ${scriptName} script.
+        const spellCheckPrompt = `You are a professional ${languageName} language editor and spell-checker. Review and perfect the following song text in ${scriptName} script.
 
 Song text: "${song}"
 Language: ${languageName}
@@ -979,27 +1052,27 @@ QUALITY ASSURANCE:
 
 RETURN ONLY THE PERFECTED SONG TEXT, NOTHING ELSE!`;
 
-      try {
-        const correctedSong = await sendClaudeRequest(spellCheckPrompt);
-        if (correctedSong && correctedSong.trim().length > 50) {
-          song = correctedSong.trim();
-          console.log(
-            `✅ Stage 2 completed. ${languageName} spell checking done.`
+        try {
+          const correctedSong = await sendClaudeRequest(spellCheckPrompt);
+          if (correctedSong && correctedSong.trim().length > 50) {
+            song = correctedSong.trim();
+            console.log(
+              `✅ Stage 2 completed. ${languageName} spell checking done.`
+            );
+          }
+        } catch (spellCheckError) {
+          console.warn(
+            `⚠️ Stage 2 error for ${languageName}:`,
+            spellCheckError.message
           );
+          console.log("Original song retained");
         }
-      } catch (spellCheckError) {
-        console.warn(
-          `⚠️ Stage 2 error for ${languageName}:`,
-          spellCheckError.message
-        );
-        console.log("Original song retained");
       }
-    }
 
-    // Stage 3: Final quality check
-    console.log("🔍 Stage 3: Final quality verification...");
+      // Stage 3: Final quality check
+      console.log("🔍 Stage 3: Final quality verification...");
 
-    const finalCheckPrompt = `You are a final quality reviewer for ${languageName} songs. Review this song one last time and make any final improvements needed.
+      const finalCheckPrompt = `You are a final quality reviewer for ${languageName} songs. Review this song one last time and make any final improvements needed.
 
 Song: "${song}"
 Language: ${languageName}
@@ -1019,71 +1092,77 @@ Make any final small improvements needed, but preserve the overall structure and
 
 RETURN ONLY THE FINAL PERFECTED SONG TEXT!`;
 
-    try {
-      const finalSong = await sendClaudeRequest(finalCheckPrompt);
-      if (finalSong && finalSong.trim().length > 50) {
-        song = finalSong.trim();
-        console.log("✅ Stage 3 completed. Final quality check done.");
+      try {
+        const finalSong = await sendClaudeRequest(finalCheckPrompt);
+        if (finalSong && finalSong.trim().length > 50) {
+          song = finalSong.trim();
+          console.log("✅ Stage 3 completed. Final quality check done.");
+        }
+      } catch (finalError) {
+        console.warn("⚠️ Stage 3 error:", finalError.message);
+        console.log("Previous version retained");
       }
-    } catch (finalError) {
-      console.warn("⚠️ Stage 3 error:", finalError.message);
-      console.log("Previous version retained");
-    }
 
-    console.log(
-      `🎉 Song generation completed successfully. Final length: ${song.length}`
-    );
+      console.log(
+        `🎉 Song generation completed successfully. Final length: ${song.length}`
+      );
 
-    res.json({
-      success: true,
-      data: {
-        song: song,
-        recommendedMusic: recommendedMusic,
-        topic: topic,
-        style: style,
-        language: language,
-        languageName: languageName,
-        script: script,
-        conditions: conditions,
-        spellChecked: true,
-        qualityChecked: true,
-        generated_at: new Date().toISOString(),
-      },
-    });
-  } catch (error) {
-    console.error("❌ Song generation error:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || "Song generation failed",
-    });
-  }
-});
-
-// Word suggestions endpoint (bonus feature)
-app.post("/api/word-suggestions", async (req, res) => {
-  try {
-    const { word, language = "uz", limit = 5 } = req.body;
-
-    if (!word || !word.trim()) {
-      return res.status(400).json({
+      res.json({
+        success: true,
+        data: {
+          song: song,
+          recommendedMusic: recommendedMusic,
+          topic: topic,
+          style: style,
+          language: language,
+          languageName: languageName,
+          script: script,
+          conditions: conditions,
+          spellChecked: true,
+          qualityChecked: true,
+          generated_at: new Date().toISOString(),
+        },
+      });
+    } catch (error) {
+      console.error("❌ Song generation error:", error);
+      res.status(500).json({
         success: false,
-        error: "Word is required",
+        error: error.message || "Song generation failed",
       });
     }
+  }
+);
 
-    const script = detectScript(word);
-    const scriptName =
-      script === "latin" || script === "mixed" ? "Latin" : "Cyrillic";
+// Word suggestions endpoint (bonus feature) - PROTECTED
+app.post(
+  "/api/word-suggestions",
+  rateLimitAPI,
+  protect,
+  dynamicRateLimit,
+  async (req, res) => {
+    try {
+      const { word, language = "uz", limit = 5 } = req.body;
 
-    const languageMap = {
-      uz: "Uzbek",
-      kaa: "Karakalpak",
-      ru: "Russian",
-    };
+      if (!word || !word.trim()) {
+        return res.status(400).json({
+          success: false,
+          error: "Word is required",
+        });
+      }
 
-    const languageName = languageMap[language] || "Karakalpak";
+      const script = detectScript(word);
+      const scriptName =
+        script === "latin" || script === "mixed" ? "Latin" : "Cyrillic";
 
-    const prompt = `Provide ${limit} spelling suggestions for the ${languageName} word "${word}" written in ${scriptName} script.
+      const languageMap = {
+        uz: "Uzbek",
+        kaa: "Karakalpak",
+        ru: "Russian",
+      };
+
+      const languageName = languageMap[language] || "Karakalpak";
+
+      const prompt = `Provide ${limit} spelling suggestions for the ${languageName} word "${word}" written in ${scriptName} script.
 
 Word: "${word}"
 Language: ${languageName}
@@ -1112,74 +1191,80 @@ Return response ONLY in JSON format:
 
 Return ONLY JSON response.`;
 
-    const content = await sendClaudeRequest(prompt);
-
-    try {
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      const jsonContent = jsonMatch ? jsonMatch[0] : content;
-      const parsedResult = JSON.parse(jsonContent);
-
-      res.json({
-        success: true,
-        data: parsedResult.suggestions || [],
-      });
-    } catch (parseError) {
-      console.error("JSON parse error for word suggestions:", parseError);
-      res.status(500).json({
-        success: false,
-        error: "Failed to parse suggestions response",
-      });
-    }
-  } catch (error) {
-    console.error("Word suggestions error:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message || "Word suggestions failed",
-    });
-  }
-});
-
-// Batch spell check endpoint (bonus feature)
-app.post("/api/batch-spell-check", async (req, res) => {
-  try {
-    const { texts, language = "uz", script } = req.body;
-
-    if (!texts || !Array.isArray(texts) || texts.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: "Texts array is required",
-      });
-    }
-
-    if (texts.length > 10) {
-      return res.status(400).json({
-        success: false,
-        error: "Maximum 10 texts allowed per batch",
-      });
-    }
-
-    const results = [];
-
-    for (let i = 0; i < texts.length; i++) {
-      const text = texts[i];
-      console.log(`📝 Processing batch item ${i + 1}/${texts.length}`);
+      const content = await sendClaudeRequest(prompt);
 
       try {
-        // Use the same logic as single spell check
-        const detectedScript = script || detectScript(text);
-        const languageMap = {
-          uz: "Uzbek",
-          kaa: "Karakalpak",
-          ru: "Russian",
-        };
-        const languageName = languageMap[language] || "Karakalpak";
-        const scriptName =
-          detectedScript === "latin" || detectedScript === "mixed"
-            ? "Latin"
-            : "Cyrillic";
+        const jsonMatch = content.match(/\{[\s\S]*\}/);
+        const jsonContent = jsonMatch ? jsonMatch[0] : content;
+        const parsedResult = JSON.parse(jsonContent);
 
-        // Simple spell check prompt for batch processing
-        const prompt = `Check spelling for this ${languageName} text in ${scriptName} script: "${text}"
+        res.json({
+          success: true,
+          data: parsedResult.suggestions || [],
+        });
+      } catch (parseError) {
+        console.error("JSON parse error for word suggestions:", parseError);
+        res.status(500).json({
+          success: false,
+          error: "Failed to parse suggestions response",
+        });
+      }
+    } catch (error) {
+      console.error("Word suggestions error:", error);
+      res.status(500).json({
+        success: false,
+        error: error.message || "Word suggestions failed",
+      });
+    }
+  }
+);
+
+// Batch spell check endpoint (bonus feature) - PROTECTED
+app.post(
+  "/api/batch-spell-check",
+  rateLimitHeavy,
+  protect,
+  dynamicRateLimit,
+  async (req, res) => {
+    try {
+      const { texts, language = "uz", script } = req.body;
+
+      if (!texts || !Array.isArray(texts) || texts.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: "Texts array is required",
+        });
+      }
+
+      if (texts.length > 10) {
+        return res.status(400).json({
+          success: false,
+          error: "Maximum 10 texts allowed per batch",
+        });
+      }
+
+      const results = [];
+
+      for (let i = 0; i < texts.length; i++) {
+        const text = texts[i];
+        console.log(`📝 Processing batch item ${i + 1}/${texts.length}`);
+
+        try {
+          // Use the same logic as single spell check
+          const detectedScript = script || detectScript(text);
+          const languageMap = {
+            uz: "Uzbek",
+            kaa: "Karakalpak",
+            ru: "Russian",
+          };
+          const languageName = languageMap[language] || "Karakalpak";
+          const scriptName =
+            detectedScript === "latin" || detectedScript === "mixed"
+              ? "Latin"
+              : "Cyrillic";
+
+          // Simple spell check prompt for batch processing
+          const prompt = `Check spelling for this ${languageName} text in ${scriptName} script: "${text}"
 
 Return only valid JSON:
 {
@@ -1189,74 +1274,113 @@ Return only valid JSON:
   ]
 }`;
 
-        const content = await sendClaudeRequest(prompt);
-        let parsedResult;
+          const content = await sendClaudeRequest(prompt);
+          let parsedResult;
 
-        try {
-          parsedResult = JSON.parse(content);
-        } catch (parseError) {
-          parsedResult = cleanAndParseJSON(content);
+          try {
+            parsedResult = JSON.parse(content);
+          } catch (parseError) {
+            parsedResult = cleanAndParseJSON(content);
+          }
+
+          const words = text.split(/\s+/).filter((w) => w.trim());
+          const totalWords = words.length;
+          const incorrectWords =
+            parsedResult.results?.filter((r) => !r.isCorrect).length || 0;
+          const accuracy =
+            totalWords > 0
+              ? (((totalWords - incorrectWords) / totalWords) * 100).toFixed(1)
+              : 100;
+
+          results.push({
+            index: i,
+            text: text,
+            success: true,
+            results: parsedResult.results || [],
+            statistics: {
+              totalWords,
+              incorrectWords,
+              accuracy: parseFloat(accuracy),
+              language: languageName,
+            },
+          });
+        } catch (error) {
+          results.push({
+            index: i,
+            text: text,
+            success: false,
+            error: error.message,
+          });
         }
-
-        const words = text.split(/\s+/).filter((w) => w.trim());
-        const totalWords = words.length;
-        const incorrectWords =
-          parsedResult.results?.filter((r) => !r.isCorrect).length || 0;
-        const accuracy =
-          totalWords > 0
-            ? (((totalWords - incorrectWords) / totalWords) * 100).toFixed(1)
-            : 100;
-
-        results.push({
-          index: i,
-          text: text,
-          success: true,
-          results: parsedResult.results || [],
-          statistics: {
-            totalWords,
-            incorrectWords,
-            accuracy: parseFloat(accuracy),
-            language: languageName,
-          },
-        });
-      } catch (error) {
-        results.push({
-          index: i,
-          text: text,
-          success: false,
-          error: error.message,
-        });
       }
-    }
 
-    res.json({
-      success: true,
-      data: {
-        results: results,
-        summary: {
-          total: texts.length,
-          successful: results.filter((r) => r.success).length,
-          failed: results.filter((r) => !r.success).length,
-          language: language,
+      res.json({
+        success: true,
+        data: {
+          results: results,
+          summary: {
+            total: texts.length,
+            successful: results.filter((r) => r.success).length,
+            failed: results.filter((r) => !r.success).length,
+            language: language,
+          },
         },
-      },
-    });
-  } catch (error) {
-    console.error("Batch spell check error:", error);
-    res.status(500).json({
+      });
+    } catch (error) {
+      console.error("Batch spell check error:", error);
+      res.status(500).json({
+        success: false,
+        error: error.message || "Batch spell check failed",
+      });
+    }
+  }
+);
+
+// Global error handling middleware
+app.use((error, req, res, next) => {
+  logger.error("Unhandled error:", error);
+
+  if (error.name === "ValidationError") {
+    const errors = Object.values(error.errors).map((err) => err.message);
+    return res.status(400).json({
       success: false,
-      error: error.message || "Batch spell check failed",
+      error: "Validation error",
+      details: errors,
     });
   }
-});
 
-// Error handling middleware
-app.use((error, req, res, next) => {
+  if (error.name === "CastError") {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid ID format",
+    });
+  }
+
+  if (error.code === 11000) {
+    const field = Object.keys(error.keyValue)[0];
+    return res.status(400).json({
+      success: false,
+      error: `${field} already exists`,
+    });
+  }
+
+  // Operational errors
+  if (error.isOperational) {
+    return res.status(error.statusCode).json({
+      success: false,
+      error: error.message,
+    });
+  }
+
+  // Programming errors
   console.error("❌ Unhandled error:", error);
   res.status(500).json({
     success: false,
     error: "Internal server error",
-    message: error.message,
+    message:
+      process.env.NODE_ENV === "development"
+        ? error.message
+        : "Something went wrong",
   });
 });
 
@@ -1270,6 +1394,19 @@ app.use("*", (req, res) => {
       "GET /api/health",
       "GET /api/test-connection",
       "GET /api/debug-test",
+      "POST /api/auth/signup",
+      "POST /api/auth/login",
+      "GET /api/auth/logout",
+      "GET /api/auth/me",
+      "PATCH /api/auth/update-me",
+      "PATCH /api/auth/update-password",
+      "DELETE /api/auth/delete-me",
+      "GET /api/auth/stats",
+      "GET /api/history",
+      "GET /api/history/stats",
+      "GET /api/history/search",
+      "GET /api/history/export",
+      "DELETE /api/history/clear",
       "POST /api/spell-check",
       "POST /api/correct-text",
       "POST /api/transliterate",
@@ -1282,9 +1419,20 @@ app.use("*", (req, res) => {
   });
 });
 
+// Graceful shutdown
+process.on("SIGINT", () => {
+  console.log("SIGINT received. Shutting down gracefully...");
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  console.log("SIGTERM received. Shutting down gracefully...");
+  process.exit(0);
+});
+
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 OrfoAI Backend Server running on port ${PORT}`);
+  console.log(`🚀 OrfoAI Backend Server with Auth running on port ${PORT}`);
   console.log(`📡 API Base URL: http://localhost:${PORT}/api`);
   console.log(`🔍 Debug URL: http://localhost:${PORT}/api/debug-test`);
   console.log(
@@ -1295,18 +1443,38 @@ app.listen(PORT, () => {
   console.log("   - Health: GET /api/health");
   console.log("   - Test: GET /api/test-connection");
   console.log("   - Debug: GET /api/debug-test");
-  console.log("   - Spell Check: POST /api/spell-check");
-  console.log("   - Correct Text: POST /api/correct-text");
-  console.log("   - Transliterate: POST /api/transliterate");
-  console.log("   - Auto Transliterate: POST /api/auto-transliterate");
-  console.log("   - Improve Text: POST /api/improve-text");
-  console.log("   - Generate Song: POST /api/generate-song");
-  console.log("   - Word Suggestions: POST /api/word-suggestions");
-  console.log("   - Batch Spell Check: POST /api/batch-spell-check");
+  console.log("   - Auth: /api/auth/*");
+  console.log("   - History: /api/history/*");
+  console.log("   - Spell Check: POST /api/spell-check [PROTECTED]");
+  console.log("   - Correct Text: POST /api/correct-text [PROTECTED]");
+  console.log("   - Transliterate: POST /api/transliterate [PROTECTED]");
+  console.log(
+    "   - Auto Transliterate: POST /api/auto-transliterate [PROTECTED]"
+  );
+  console.log("   - Improve Text: POST /api/improve-text [PROTECTED]");
+  console.log("   - Generate Song: POST /api/generate-song [PROTECTED]");
+  console.log("   - Word Suggestions: POST /api/word-suggestions [PROTECTED]");
+  console.log(
+    "   - Batch Spell Check: POST /api/batch-spell-check [PROTECTED]"
+  );
 
   if (!process.env.ANTHROPIC_API_KEY) {
     console.error(
       "⚠️  WARNING: ANTHROPIC_API_KEY not found in environment variables!"
+    );
+    console.error("Please check your .env file");
+  }
+
+  if (!process.env.DATABASE_URI) {
+    console.error(
+      "⚠️  WARNING: DATABASE_URI not found in environment variables!"
+    );
+    console.error("Please check your .env file");
+  }
+
+  if (!process.env.JWT_SECRET) {
+    console.error(
+      "⚠️  WARNING: JWT_SECRET not found in environment variables!"
     );
     console.error("Please check your .env file");
   }
