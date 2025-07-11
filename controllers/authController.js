@@ -91,6 +91,7 @@ export const signup = catchAsync(async (req, res, next) => {
 // Kirish
 export const login = catchAsync(async (req, res, next) => {
   const { phoneNumber, password } = req.body;
+  console.log(req.body);
 
   // Validatsiya
   if (!phoneNumber || !password) {
